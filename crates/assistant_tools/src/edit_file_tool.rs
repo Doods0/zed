@@ -1,13 +1,16 @@
 use crate::{replace::replace_with_flexible_indent, schema::json_schema_for};
 use anyhow::{Context as _, Result, anyhow};
-use assistant_tool::{ActionLog, Tool, ToolResult};
-use gpui::{App, AppContext, AsyncApp, Entity, Task};
+use assistant_tool::{ActionLog, Tool, ToolCard, ToolResult, ToolUseStatus};
+use buffer_diff::{BufferDiff, BufferDiffSnapshot};
+use editor::{MultiBuffer, PathKey};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, IntoElement, Task, Window, prelude::*};
+use language::{Anchor, Buffer, Capability, LanguageRegistry, LineEnding, OffsetRangeExt};
 use language_model::{LanguageModelRequestMessage, LanguageModelToolSchemaFormat};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
-use ui::IconName;
+use ui::{Color, IconName, IconSize, prelude::*};
 
 use crate::replace::replace_exact;
 
@@ -90,7 +93,7 @@ impl Tool for EditFileTool {
             Err(err) => return Task::ready(Err(anyhow!(err))).into(),
         };
 
-        cx.spawn(async move |cx: &mut AsyncApp| {
+        let output = cx.spawn(async move |cx: &mut AsyncApp| {
             let project_path = project.read_with(cx, |project, cx| {
                 project
                     .find_project_path(&input.path, cx)
@@ -166,18 +169,158 @@ impl Tool for EditFileTool {
                 snapshot
             })?;
 
-            project.update( cx, |project, cx| {
-                project.save_buffer(buffer, cx)
+            project.update(cx, |project, cx| {
+                project.save_buffer(buffer.clone(), cx)
             })?.await?;
+
+            let buffer_diff =
+                build_buffer_diff(Some(old_text.clone()), &buffer, cx).await?;
+
+            let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadOnly)).unwrap();
+
+            multibuffer.update(cx, |multibuffer, cx| {
+                let snapshot = buffer.read(cx).snapshot();
+                let diff = buffer_diff.read(cx);
+                let diff_hunk_ranges = diff
+                    .hunks_intersecting_range(Anchor::MIN..Anchor::MAX, &snapshot, cx)
+                    .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot))
+                    .collect::<Vec<_>>();
+                let path = snapshot.file().unwrap().path().clone();
+                const FILE_NAMESPACE: u32 = 1;
+                let _is_newly_added = multibuffer.set_excerpts_for_path(
+                    PathKey::namespaced(FILE_NAMESPACE, path),
+                    buffer.clone(),
+                    diff_hunk_ranges,
+                    0, // context
+                    cx,
+                );
+                multibuffer.add_diff(buffer_diff, cx);
+            });
 
             let diff_str = cx.background_spawn(async move {
                 let new_text = snapshot.text();
                 language::unified_diff(&old_text, &new_text)
             }).await;
 
+            Ok((format!("Edited {}:\n\n```diff\n{}\n```", input.path.display(), diff_str)))
+        });
 
-            Ok(format!("Edited {}:\n\n```diff\n{}\n```", input.path.display(), diff_str))
+        let card = cx
+            .new(|cx| {
+                let (_, diff_buffer) = output.read(cx)?;
+                EditFileToolCard::new(diff_buffer, cx)
+            })
+            .into();
 
-        }).into()
+        ToolResult {
+            output,
+            card: Some(card),
+        }
     }
+}
+
+struct EditFileToolCard {
+    diff: Option<Result<Entity<MultiBuffer>>>,
+    _task: Task<()>,
+}
+
+impl EditFileToolCard {
+    fn new(diff: Entity<BufferDiff>, cx: &mut Context<Self>) -> Self {
+        let _task = cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                this.diff = Some(Ok(diff));
+                cx.notify();
+            })
+            .ok();
+        });
+
+        Self { diff: None, _task }
+    }
+}
+
+impl ToolCard for EditFileToolCard {
+    fn render(
+        &mut self,
+        _status: &ToolUseStatus,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let header = h_flex()
+            .id("tool-label-container")
+            .gap_1p5()
+            .max_w_full()
+            .overflow_x_scroll()
+            .child(
+                Icon::new(IconName::Pencil)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child("File Edit")
+            .into_any();
+
+        let content = self.diff.as_ref().and_then(|diff| match diff {
+            Ok(diff) => {
+                let snapshot = diff.read(cx).snapshot();
+                let hunks = snapshot
+                    .hunks_intersecting_range(Anchor::MIN..Anchor::MAX, &snapshot, cx)
+                    .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+                    .collect::<Vec<_>>();
+
+                Some(
+                    v_flex()
+                        .ml_1p5()
+                        .pl_1p5()
+                        .border_l_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .gap_1()
+                        .child(diff.clone())
+                        .into_any(),
+                )
+            }
+            Err(_) => None,
+        });
+
+        v_flex().my_2().gap_1().child(header).children(children)
+    }
+}
+
+async fn build_buffer_diff(
+    mut old_text: Option<String>,
+    buffer: &Entity<Buffer>,
+    cx: &mut AsyncApp,
+) -> Result<Entity<BufferDiff>> {
+    if let Some(old_text) = &mut old_text {
+        LineEnding::normalize(old_text);
+    }
+
+    let buffer = cx.update(|cx| buffer.read(cx).snapshot())?;
+
+    let base_buffer = cx
+        .update(|cx| {
+            Buffer::build_snapshot(
+                old_text.as_deref().unwrap_or("").into(),
+                buffer.language().cloned(),
+                // TODO: provide LanguageRegistry to have syntax highlighting
+                None,
+                cx,
+            )
+        })?
+        .await;
+
+    let diff_snapshot = cx
+        .update(|cx| {
+            BufferDiffSnapshot::new_with_base_buffer(
+                buffer.text.clone(),
+                old_text.map(Arc::new),
+                base_buffer,
+                cx,
+            )
+        })?
+        .await;
+
+    cx.new(|cx| {
+        let mut diff = BufferDiff::new(&buffer.text, cx);
+        diff.set_snapshot(diff_snapshot, &buffer.text, cx);
+        diff
+    })
 }
